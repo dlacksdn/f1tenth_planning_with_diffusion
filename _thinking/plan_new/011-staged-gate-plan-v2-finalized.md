@@ -1,0 +1,184 @@
+# 011 — 단계 게이트 계획 v2 (010 검수 반영·확정)
+
+> 2026-06-20. [[009-dataset-status-problem-and-staged-plan]]의 **개정·확정판**. 적대적 검수
+> [[010-adversarial-critic-of-staged-gate-plan]](판정 B 조건부, 014를 1차 소스로 정정)을 전부 반영.
+> 이 문서가 **현재 실행 SSOT**다. append-only. 다음 세션 인수인계용 + 사용자 검토용 — 엄밀하게(파일·
+> 라인·집계 수치) + 쉽게(용어 풀이·비유·표). git 미실행(작성만).
+
+---
+
+## 0. 용어 빠른 풀이 (009 것 + 010이 새로 쓴 것)
+
+| 용어 | 한 줄 뜻 |
+|---|---|
+| **prior(프라이어)** | Diffuser가 데이터에서 배운 "주행 습관/밑그림". 데이터가 어떤 주행으로 가득하면 그쪽으로 그린다. |
+| **value(밸류)** | 한 주행 계획에 "점수"를 매기는 채점관. 높은 쪽으로 계획을 미는 게 guidance, 미는 세기가 scale. |
+| **BC (행동복제)** | scale=0 = value 안 쓰고 prior를 그대로 흉내내기. "데이터에 있던 주행을 따라함". |
+| **stitching(스티칭)** | 데이터에 없던 조합을 **이어붙여** 새 주행을 만드는 능력(offline RL이 원본 정책을 넘는 핵심). ★단 Diffuser는 한 번에 **128 step=2.56초** 윈도만 그린다 → 스티칭도 그 창 안에서만. |
+| **RTG (return-to-go)** | value가 실제로 배우는 점수 = "지금부터 **에피소드 끝까지** 받을 보상의 할인 합"(sequence.py:146). |
+| **유효 지평(effective horizon)** | γ=0.99에서 value가 "실질적으로 내다보는" 거리 ≈ 1/(1−γ) = **약 100 step(2초)**. 그보다 먼 미래는 점수에 거의 0. |
+| **mixture-averaging(혼합 평균)** | 출발 관측이 같으면(정지) Diffuser가 느린 모드·빠른 모드의 **평균**을 그려 어느 쪽도 아닌 흐릿한 주행이 나오는 현상. |
+| **compounding error(누적 오차)** | 닫힌 루프에서 매 step 작은 오차가 쌓여 데이터 밖으로 벗어남. **prior가 깨끗해져도 자동으로 안 사라진다.** |
+| **closed-loop / K=1 MPC** | 차가 자기 행동 결과를 다시 입력받아 주행. 그린 128 step 중 앞 1개만 쓰고 매 step 다시 그림(K=1). |
+
+> 큰 그림(변함없음): 데이터로 Diffuser 학습 → "주행 계획"을 그림 → value로 더 빠르게 유도 →
+> baseline(cap-5 2랩 **107.16s**)보다 빠른 2랩 주행. 추가 수집 없이(offline) 해내는 게 과제.
+
+---
+
+## 1. 009에서 무엇이 바뀌었나 (010 반영 — 한눈 요약)
+
+| # | 항목 | 009 (구) | **011 (확정)** | 근거(1차 소스) |
+|---|---|---|---|---|
+| 1 | **value 역할** | "충돌 영역 *밖에서* 속도 유도" | **value는 완주를 못 보상 → 안전=prior 단독, value=속도만** | 010 §4 |
+| 2 | **D3 정체** | "value가 충돌을 4배 선호" | **충돌 선호가 아니라 *속도* 선호** (충돌-임박 윈도는 이미 저점) | 010 §5 |
+| 3 | **B1(벌점 증폭)** | stretch 핵심 엔진 | **효과 좁음(충돌-임박 회피만), 무비용 선검증 후 강등 가능** | 010 §5,§8-4 |
+| 4 | **B3 warm-start** | "코어 무변경 글루" | **코어 수정 필요 → 기본경로 제외, 최후수단(사용자 승인)** | 010 §6,§8-1 |
+| 5 | **Track A 데이터** | 완주 52 균등 | **cap10 완주 가중**(혼합 평균 회피) | 010 §2,§8-2 |
+| 6 | **게이트 기준** | "완주율 의미있게>0, 후진 소멸" | **`cmd_speed_mean>0` + n≥10~20** (정량) | 010 §3,§8-3 |
+| 7 | **Track A의 value** | "value 안 씀" | **value ckpt 로드는 강제 → scale=0으로 무효화** | 010 §7 |
+| 8 | **정규화 통일** | "어떤 모드든 전체 stats" | **A=complete 자기정합(통일 불필요), B만 prior/value 공유** | 010 §8-5 |
+| 9 | **stretch 기대** | "<56s 노림" | **매우 낮은 확률 — 보고서 무게중심을 *분석*으로 이동** | 010 §9 + 본 판단 |
+
+---
+
+## 2. ★ 가장 중요한 깨달음 — value는 "완주"를 점수로 줄 수 없다 (010 §4)
+
+이게 v2의 출발점이다. **쉬운 설명**: value의 시야는 약 2초(100 step)다. 그런데 랩 완주 보너스(+100)는
+보통 수백~1400 step **앞**에 있다. γ=0.99로 할인하면:
+
+| 랩 보너스(+100)가 ~앞에 | value에 실제로 더해지는 점수 |
+|---|---|
+| 100 step 앞 | +36.6 |
+| 500 step 앞 | +0.66 |
+| **1400 step 앞(=실제 랩1 거리)** | **+0.0001** (사실상 0) |
+
+→ **value는 "이 계획이 랩을 완주한다"는 사실에서 점수를 못 얻는다. 오직 다음 2초가 빠른지(progress=속도)만 본다.**
+
+**이 한 가지가 계획 전체를 다시 정렬한다:**
+- ✅ **안전·완주는 100% prior가 만든다.** value는 그 위에 "더 빨리"만 얹는다. → 그래서 "깨끗한 prior가
+  단독으로 안전 완주를 내는가"(Track A)는 *반드시 먼저 단독 시험*해야 할 **계획의 대전제**다. 단계 게이트가
+  헛단계가 아니라 핵심 가정의 시험인 이유.
+- ⚠️ **stretch(<56s)의 엔진이 약하다.** value는 prior가 *이미 만들 수 있는* 가장 빠른 모드로 밀 뿐, 없는
+  속도를 창조하지 못한다.
+
+### 2.1 그래서 stretch의 진짜 병목은 value(D3)가 아니다 (본 판단, 010 너머)
+세 검수(014·010)와 1차 소스를 합치면:
+1. value는 "더 빨리"만 준다(§2). 2. prior에 넣을 고속 재료(cap15/20 lap1)는 **전부 충돌-직전 한계주행**
+(014 §3: cap15의 27%가 lap2 즉시 충돌). 3. **stitching은 2.56초 창 안에서만** 일어난다(2랩=~2800 step은
+창 밖, 닫힌 루프로 윈도가 이어질 때만 간접 연결).
+→ **진짜 병목 = "빠르면서도 코너를 버티는 지속가능한 고속 윈도"의 부재.** value를 고쳐도, warm-start를
+넣어도, 데이터에 그 재료가 없으면 stretch는 안 나온다. **이건 양도 value도 아닌 "재료의 질" 문제다.**
+- 닫힌 베팅은 아님: 한계주행 lap1 안에도 "코너를 잘 통과한 윈도"는 있다(충돌은 특정 코너에서만).
+  prior가 그 좋은 윈도만 골라 닫힌 루프로 이으면 sustainable해질 *여지*는 있다 — **될지는 Track B를
+  돌려야만 안다.** 낮은 확률, 0은 아님.
+
+---
+
+## 3. 확정 계획 — 단계 게이트 v2
+
+### 3.1 Track A — "깨끗한 prior 단독으로 안전 완주가 되는가" (대전제 시험)
+
+| 단계 | 할 일 | 1차 소스 / 주의 | 비용 |
+|---|---|---|---|
+| **A1** | 로더에 `F1TENTH_MODE` 플래그. **complete = 완주 ep만**(npz `is_terminal` 전부 False). ★ **cap10 완주(30)에 가중** 또는 `cap10-only` 변형 병행 | `datasets/f1tenth.py` `f1tenth_sequence_dataset`에 ep 필터(line 107~). normalizer는 로드된 complete 데이터로 자동 fit = **자기정합**(통일 불필요, §5) | 소 |
+| **A2** | diffusion 재학습(complete prior) | `scripts/train.py --config config.f1tenth` (★`n_train_steps`=10000 배수). 데이터 작아 P4(80k saturate)보다 빨리 수렴 가능 | GPU **~4-6h** |
+| **A3** | 평가: **scale=0(BC), K=1, n≥10~20** | `plan_f1tenth.py`(V_MAX=20, RL_project venv, cwd=vendor/diffuser). ★ value ckpt는 **로드만 강제**되니 기존 P6 value를 두고 scale=0으로 무효화(§7) | 분~시간 |
+
+**게이트 판정 (정량 — 기존 로깅 `plan_f1tenth.py:85-88` 활용):**
+
+| 결과 | 기준 | 다음 |
+|---|---|---|
+| ✅ **통과** | `cmd_speed_mean > 0`(후진 소멸; 이상적 p90 ≥ ~5 m/s) **+ 완주율 의미있게 ↑**(n≥10~20에서) **+ 2랩 107s 초과** | Track B |
+| ⚠️ **부분** | 전진은 회복(mean cmd>0)인데 완주 불안정 | **코어 무변경 레버 먼저**: cap10-가중 강화 → K 중간값(2/3/5) → scale 소폭. (warm-start 아님 — §6) |
+| ❌ **실패** | 여전히 충돌·후진 | 진단 재개(obs/conditioning 구조 의심), B 보류 |
+
+> ★ P6 degenerate는 `cmd_speed_mean = −4.0`(후진)이었다(013 §1). 그래서 "후진 소멸"을 **눈대중이 아니라
+> `cmd_speed_mean>0` 숫자로** 박는다. n=5로 0/5 vs 1/5를 가르던 자의성(010 §3)도 n≥10~20으로 제거.
+
+### 3.2 Track B — 진짜 개선 시도 (A=✅ 후에만, 재설계됨)
+
+| 단계 | 할 일 | 주의 (010 반영) | 비용 |
+|---|---|---|---|
+| **B0** | **무비용 선검증**(npz 조회): "충돌-임박 H128" vs "지속가능-고속 H128"(cap15/20 中 lap2까지 버틴 ep의 lap1 윈도)의 RTG 분리 측정 | 010 §8-4. 안 갈리면 **B1 강등**(벌점 증폭이 guidance에 실효 없음 확정) | 0 |
+| **B1** | (B0 통과 시) value reward 재조립 — 충돌 벌점 −10→후보(−50/−100) 재학습 | ★효과=**충돌-임박 회피만**, 속도 편애는 안 고쳐짐(010 §5). reward 재조립 가능 확인됨(`reward`=성분 5개 합, 오차0; `log_reward_collision` 분리저장). diffusion 정규화 무관(reward는 정규화 안 함) | GPU value **~5-10h** |
+| **B2** | **driving prior**(완주+추출 고속랩 249) 재학습, **분리 로깅** | 한계주행이라(014 §3) 안전 prior와 분리해 "어느 재료가 닫힌 루프를 깨는지" 추적. ★B2 diffusion과 B1 value는 **같은 전체-stats normalizer 공유 필수**(§5) | GPU **~6-8h** |
+| **B3** | warm-start (**기본 경로 제외 — 최후수단**) | ★코어 무변경으론 **불가**(diffusion.py:163 초기 노이즈 하드코딩, 주입 인자 없음; 010 §6). 필요시에만 **코어 예외 2건째로 사용자 승인** 후 `x_init/t_start` 인자 추가, 또는 조건-주입형(효과 미검증) | 소(승인 시) |
+| **B4** | 평가: **scale 스윕(0/0.1/0.3) × K 스윕**. 목표 <56s | value가 충돌로 밀면 scale↓로 균형 | 시간 |
+
+### 3.3 게이트 흐름도 (⚠️ 출구 수정 — 막혔던 B3 우회)
+```
+A1 로더(cap10가중) → A2 학습 → A3 평가(BC,n≥10~20) → [게이트]
+   ├─ ✅ ─► B0(무비용 RTG분리) ─► (갈리면)B1 / (안갈리면 B1강등) ─► B2(고속랩) ─► B4(스윕)
+   ├─ ⚠️ ─► [코어 무변경 레버] cap10가중↑ → K중간(2/3/5) → scale소폭 ─► A3 재평가
+   │           └─ 그래도 ❌ ─► warm-start 도입 여부 결정(코어 예외 2건째 = 사용자 승인)
+   └─ ❌ ─► 진단 재개, B 보류
+```
+> 009의 흐름도는 ⚠️→B3(warm-start)였는데 **B3가 코어 무변경으론 막혀**(010 §6) 길이 끊겼다. v2는
+> ⚠️ 출구를 **코어 무변경 레버**로 돌려 열었다.
+
+---
+
+## 4. 정직한 기대치 재조정
+
+| 층위 | 방법 | 가장 그럴듯한 결과 | 확률 | 보고서 의미 |
+|---|---|---|---|---|
+| **안전 완주 복원** | Track A(cap10-가중 prior, BC) | **56s대 완주**(baseline 107s 초과) — 단 cap10 모드를 *깨끗이* 잡아야(혼합 평균 회피) | 중간 | 문자적 성공 = **모방** |
+| **진짜 개선** | Track B(고속랩 + value) | <56s | **낮음**(지속가능 고속 재료 부재 §2.1) | offline RL **stitching** 입증 |
+
+- BC만으론 behavior(cap10, 56s)를 못 넘는다. **stretch는 §2.1의 재료 한계가 본질 병목**이라, 현 데이터로는
+  낮은 확률이다 — 정직하게 인정한다.
+- ★ **보고서 무게중심 이동**: "expert 복원"❌ → "**충돌-위주 offline 데이터로 안전 완주 복원 + 그 이상이
+  왜 어려운가의 1차 소스 정량 분석**". 분석 산출물(전부 1차 소스 확보):
+  - value는 **완주를 보상 못 함**(유효 지평 2초 vs 랩 1400 step, 010 §4)
+  - 진짜 D3 = "충돌 선호"가 아니라 **"속도 선호"**, 벌점 증폭으로 안 고쳐짐(010 §5)
+  - 고속 재료는 **충돌-직전 한계주행**이라 닫힌 루프 lap2 재현(014 §3)
+  - warm-start는 **코어 수정 필요**(010 §6)
+  - **closed-loop covariate shift**: per-step 정확↔닫힌 루프 발산(013 §2)
+- 교수님 기준(정성평가 = 명확한 개선 + **좋은 분석**)에 비춰, 이 깊이의 분석이 붙은 "안전 복원"이 강한
+  보고서다. → **Track A를 빨리 돌려 위 정성 추론들을 실측으로 바꾸는 게 다음 핵심**(검수를 더 쌓기보다).
+
+---
+
+## 5. 핵심 원칙 · 비용 · 함정
+
+### 5.1 정규화(normalizer) 정책 — A와 B가 다르다 (010 §8-5, 중요)
+- **Track A**: complete 데이터만 로드 → normalizer도 complete-only로 fit = **자기정합**. scale=0이라 value와
+  정규화가 안 맞아도 무해(×0). → **통일 불필요.** (009의 "어떤 모드든 전체 stats"는 과설계 + "ep 필터만
+  추가"와 모순이었다 — iterator서 ep 거르면 normalizer도 자동 complete-only가 됨.)
+- **Track B**: value guidance를 *쓰므로* B2 diffusion(driving)과 B1 value(전체)가 **같은 normalizer 공유
+  필수**. `check_compatibility`(serialization.py:62)는 **타입만 검사·stats 미검사**라 조용히 통과 → **사람이
+  보장**해야 함. 방법 = 전체-stats를 한 번 fit해 pickle로 양쪽에 주입(013 SSOT normalizer 글루) 또는 둘 다
+  같은 전체 데이터로 fit.
+
+### 5.2 비용 (1차 실측 기반)
+- rate **2.86 step/s**, 단일 학습 **7GB/8GB**라 diffusion·value **동시 불가 = 순차 강제**(P4 실측).
+- A2(~4-6h) + B1(~5-10h) + B2(~6-8h) + 평가 ≈ **순차 15~25h**. 무인(run_in_background)이라 인간 비용 0.
+- ★ **A2 diffusion은 진단 전용 — B2가 새로 재학습하므로 재사용 안 됨**(010 §7). A는 *자산 축적이 아니라
+  대전제 시험*이다.
+
+### 5.3 함정 체크리스트 (실행 시 1차 소스 재확인)
+- **코어 무변경**: temporal/diffusion/helpers/trainer 손대지 않음. **유일 예외 = ValueFunction fork-patch 1건**.
+  warm-start(B3) 도입 시 **2건째 = 반드시 사용자 승인 + fork-patch 기록**.
+- **Track A의 value**: scale=0이어도 `n_step_guided_p_sample`(functions.py:17-27)이 매 step value를 호출 →
+  **value ckpt가 존재해야 함**. 기존 P6 value 두고 scale=0 무효화. plan_f1tenth를 "value 없이"로 잘못
+  고치지 말 것(010 §7).
+- **게이트 정량 지표**: `cmd_speed_mean/p90/max/steer_absmean`(plan_f1tenth.py:85-88) 이미 로깅됨 → 활용.
+- **학습 step**: `n_steps_per_epoch=10000` → `--n_train_steps`는 10000 배수.
+- **실행 규약**: GPU=`run_in_background`(foreground+CUDA=exit144), 종료=PID(pkill 자기매칭 금지), 평가=
+  **RL_project .venv**(diffuser venv는 env 빌드 불가), cwd=vendor/diffuser, V_MAX=20.
+
+---
+
+## 6. 다음 착수 후보 (지시 대기)
+- **A1**(로더 complete 모드 + cap10-가중) — Track A 첫 코드.
+- **B0**(무비용 RTG 분리 검증) — npz 조회만, A와 병행 가능. B1 가치 미리 판정.
+- ★ git add/commit/push/pull 및 코드 구현은 **명시 지시 시에만**.
+
+## 7. 참조
+- 검수 누적: [[009-dataset-status-problem-and-staged-plan]](대상) → [[010-adversarial-critic-of-staged-gate-plan]]
+  (본 v2의 근거) → [[014-adversarial-critic-of-driving-prior-plan]](013 검수, 010이 §5·§6서 정정)
+- P6 진단: [[013-p6-failure-diagnosis-and-driving-prior-plan]]
+- 코드: 로더 `vendor/diffuser/diffuser/datasets/f1tenth.py` · config `config/f1tenth.py` · 평가
+  `scripts/plan_f1tenth.py` · 샘플링 `diffuser/sampling/policies.py`·`diffuser/models/diffusion.py`
+- 데이터: `f1tenth_RL_project/runs/crash_data/`(767 npz, 동결)
